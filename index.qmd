@@ -1,0 +1,423 @@
+---
+title: "Top Jazz & Culinary Establishments Across New Orleans"
+subtitle: "A Spatial and Reviewer-Adjusted Analysis Using the Yelp Open Dataset"
+author: "Student Analyst"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+    theme: cosmo
+    self-contained: false
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Research Question & Executive Summary
+
+> **Research Question:** Where can someone find the best combination of authentic dining and live jazz in New Orleans, and which localized geographic area serves as the premier destination for this experience?
+
+This analysis uses the Yelp Open Dataset to identify establishments that bridge musical performance and culinary quality across New Orleans. By evaluating category taxonomies, applying regular-expression text mining to customer Yelp reviews, performing spatial joins to official U.S. Census Bureau cartographic boundaries, and comparing localized geographic systems, we isolate the premier jazz-dining spots across the city's ZIP Code Tabulation Areas (ZCTAs).
+
+# 1. Setup & Environment
+
+```{r}
+#| label: setup
+library(tidyverse)
+library(jsonlite)
+library(lubridate)
+library(sf)
+library(tigris)
+library(scales)
+library(viridis)
+library(tidytext)
+library(leaflet)
+library(osmdata)
+library(knitr)
+
+options(tigris_use_cache = TRUE)
+options(osmdata.user_agent = "New Orleans Jazz Map Quarto Project")
+```
+
+# 2. Large Data Management & Ingestion
+
+```{r}
+#| label: load-data
+business <- readRDS("~/best-of-nola/nola_businesses.rds")
+reviews  <- readRDS("~/best-of-nola/nola_reviews.rds")
+
+glimpse(business)
+glimpse(reviews)
+```
+
+# 3. Category Selection & Review Text-Mining
+
+```{r}
+#| label: category-analysis
+biz_cats <- business %>%
+  filter(
+    str_detect(city, regex("New Orleans", ignore_case = TRUE)) | state == "LA",
+    is_open == 1,
+    !is.na(categories)
+  ) %>%
+  separate_rows(categories, sep = ",\\s*") %>%
+  mutate(categories = str_trim(categories))
+
+music_categories <- c(
+  "Jazz & Blues", "Music Venues", "Piano Bars", "Jazz Lounges", "Performing Arts"
+)
+
+food_categories <- c(
+  "Restaurants", "Cajun/Creole", "Southern", "Seafood",
+  "American (Traditional)", "American (New)", "Bistros",
+  "Soul Food", "Breakfast & Brunch"
+)
+
+candidate_venues <- biz_cats %>%
+  group_by(business_id, name, stars, review_count) %>%
+  summarize(
+    has_music_cat = any(categories %in% music_categories),
+    has_food_cat  = any(categories %in% food_categories),
+    all_categories = paste(unique(categories), collapse = " | "),
+    .groups = "drop"
+  ) %>%
+  filter(has_food_cat, has_music_cat, review_count >= 30)
+
+cat("Identified", nrow(candidate_venues), "qualifying food & music venues.\n")
+```
+
+```{r}
+#| label: text-mining-buzz
+jazz_regex <- "\\b(jazz|brass band|trio|sax|saxophone|live music|live band)\\b"
+food_regex <- "\\b(gumbo|jambalaya|etouffee|dinner|brunch|entree|po'boy|catfish|crawfish|chef)\\b"
+
+food_music_reviews <- reviews %>%
+  filter(business_id %in% candidate_venues$business_id) %>%
+  mutate(
+    mentions_jazz = str_detect(text, regex(jazz_regex, ignore_case = TRUE)),
+    mentions_food = str_detect(text, regex(food_regex, ignore_case = TRUE))
+  ) %>%
+  group_by(business_id) %>%
+  summarize(
+    total_reviews_analyzed = n(),
+    jazz_mentions = sum(mentions_jazz),
+    food_mentions = sum(mentions_food),
+    both_mentions = sum(mentions_jazz & mentions_food),
+    avg_stars_when_jazz_mentioned = mean(stars[mentions_jazz], na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ranked_candidates <- candidate_venues %>%
+  inner_join(food_music_reviews, by = "business_id") %>%
+  mutate(
+    jazz_share = jazz_mentions / total_reviews_analyzed,
+    food_share = food_mentions / total_reviews_analyzed,
+    score = (0.40 * stars) +
+      (0.30 * coalesce(avg_stars_when_jazz_mentioned, stars)) +
+      (0.30 * (log10(both_mentions + 1) / log10(max(both_mentions + 1))) * 5)
+  ) %>%
+  arrange(desc(score))
+
+selected_category_businesses <- business %>%
+  semi_join(ranked_candidates, by = "business_id") %>%
+  left_join(
+    ranked_candidates %>% select(business_id, score, jazz_mentions, both_mentions, all_categories),
+    by = "business_id"
+  )
+```
+
+# 4. Join Businesses to Reviews
+
+```{r}
+#| label: join-reviews
+category_reviews <- reviews %>%
+  semi_join(selected_category_businesses, by = "business_id") %>%
+  mutate(review_date = as_date(date), review_year = year(review_date))
+
+cat("Retained", nrow(category_reviews), "reviews across", nrow(selected_category_businesses), "selected venues.\n")
+```
+
+# 5. Spatial Boundary Verification & Physical Features
+
+```{r}
+#| label: spatial-audit
+louisiana_places <- tigris::places(
+  state = "LA", cb = TRUE, year = 2024, class = "sf"
+)
+
+restaurant_points <- selected_category_businesses %>%
+  filter(!is.na(longitude), !is.na(latitude)) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326, remove = FALSE) %>%
+  st_transform(st_crs(louisiana_places))
+
+restaurants_with_place <- restaurant_points %>%
+  st_join(
+    louisiana_places %>% select(GEOID, place_name = NAME),
+    join = st_within,
+    left = TRUE
+  )
+
+nola_official_selection <- restaurants_with_place %>%
+  filter(place_name == "New Orleans")
+
+nola_boundary <- louisiana_places %>% filter(NAME == "New Orleans")
+
+orleans_water <- tigris::area_water(
+  state = "LA", county = "Orleans", year = 2022, class = "sf"
+)
+
+cat("Confirmed", nrow(nola_official_selection), "venues within official New Orleans boundaries.\n")
+```
+
+# 6. Geographic System Comparison
+
+```{r}
+#| label: geographic-comparison
+la_zctas <- tigris::zctas(state = "LA", year = 2010, class = "sf")
+
+zcta_col_name <- names(la_zctas)[
+  str_detect(names(la_zctas), regex("^(ZCTA5|GEOID)", ignore_case = TRUE))
+][1]
+
+la_zctas_clean <- la_zctas %>% select(zcta = all_of(zcta_col_name))
+
+jazz_with_zcta <- nola_official_selection %>%
+  st_transform(st_crs(la_zctas_clean)) %>%
+  st_join(la_zctas_clean, join = st_within, left = TRUE)
+
+orleans_tracts <- tigris::tracts(
+  state = "LA", county = "Orleans", cb = TRUE, year = 2022, class = "sf"
+)
+
+jazz_with_tracts <- nola_official_selection %>%
+  st_transform(st_crs(orleans_tracts)) %>%
+  st_join(
+    orleans_tracts %>% select(tract_geoid = GEOID, tract_name = NAMELSAD),
+    join = st_within,
+    left = TRUE
+  )
+
+zcta_counts <- jazz_with_zcta %>% st_drop_geometry() %>% filter(!is.na(zcta)) %>% count(zcta)
+tract_counts <- jazz_with_tracts %>% st_drop_geometry() %>% filter(!is.na(tract_geoid)) %>% count(tract_geoid)
+
+geo_comparison_table <- tibble(
+  `Geographic system` = c("ZIP / ZCTA", "Census tract"),
+  `Number of areas` = c(nrow(zcta_counts), nrow(tract_counts)),
+  `Restaurants assigned` = c(sum(!is.na(jazz_with_zcta$zcta)), sum(!is.na(jazz_with_tracts$tract_geoid))),
+  `Unmatched restaurants` = c(sum(is.na(jazz_with_zcta$zcta)), sum(is.na(jazz_with_tracts$tract_geoid))),
+  `Smallest area count` = c(min(zcta_counts$n), min(tract_counts$n)),
+  `Largest area count` = c(max(zcta_counts$n), max(tract_counts$n))
+)
+
+kable(geo_comparison_table, caption = "Comparison of Geographic Systems for New Orleans Jazz Venues")
+```
+
+# 7. Reviewer-Adjusted Rating Analysis
+
+```{r}
+#| label: reviewer-normalization
+reviewer_activity <- category_reviews %>% count(user_id, name = "reviews_in_category")
+eligible_reviewers <- reviewer_activity %>% filter(reviews_in_category >= 5)
+
+reviewer_baselines <- category_reviews %>%
+  group_by(user_id) %>%
+  summarize(reviewer_mean = mean(stars, na.rm = TRUE), .groups = "drop")
+
+category_reviews_adjusted <- category_reviews %>%
+  left_join(reviewer_baselines, by = "user_id") %>%
+  mutate(normalized_score = stars - reviewer_mean) %>%
+  semi_join(eligible_reviewers, by = "user_id")
+
+restaurant_reviewer_summary <- category_reviews_adjusted %>%
+  group_by(business_id) %>%
+  summarize(
+    eligible_review_count = n(),
+    avg_normalized_score = mean(normalized_score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+review_comparison <- ranked_candidates %>%
+  left_join(restaurant_reviewer_summary, by = "business_id") %>%
+  filter(eligible_review_count >= 3) %>%
+  arrange(desc(avg_normalized_score))
+
+kable(
+  head(review_comparison %>% select(name, stars, eligible_review_count, avg_normalized_score), 10),
+  digits = 2,
+  caption = "Top Venues by Reviewer-Normalized Scores"
+)
+```
+
+# 8. Localized Top Venues by Area
+
+```{r}
+#| label: top-by-area
+best_jazz_by_area <- jazz_with_zcta %>%
+  st_drop_geometry() %>%
+  filter(!is.na(zcta)) %>%
+  group_by(zcta) %>%
+  arrange(desc(score), desc(review_count)) %>%
+  slice_head(n = 1) %>%
+  ungroup() %>%
+  select(business_id, zcta, name, stars, review_count, jazz_mentions, score, all_categories) %>%
+  arrange(desc(score))
+
+kable(
+  best_jazz_by_area %>% select(zcta, name, stars, review_count, jazz_mentions, score),
+  digits = 2,
+  caption = "Premier Food & Jazz Venue in Each New Orleans ZCTA"
+)
+```
+
+# 9. Optional OpenStreetMap Feature Data
+
+The basemap supplies street names automatically. This optional section downloads streets and parks as separate `sf` layers so they can be turned on and off in the layer control.
+
+```{r}
+#| label: osm-features
+#| cache: true
+nola_bbox <- nola_boundary %>%
+  st_transform(4326) %>%
+  st_bbox()
+
+osm_roads <- tryCatch(
+  opq(bbox = nola_bbox) %>%
+    add_osm_feature(
+      key = "highway",
+      value = c("primary", "secondary", "tertiary", "residential"),
+      value_exact = TRUE
+    ) %>%
+    osmdata_sf(),
+  error = function(error) NULL
+)
+
+osm_parks <- tryCatch(
+  opq(bbox = nola_bbox) %>%
+    add_osm_feature(key = "leisure", value = "park", value_exact = TRUE) %>%
+    osmdata_sf(),
+  error = function(error) NULL
+)
+
+roads_4326 <- if (!is.null(osm_roads)) osm_roads$osm_lines else NULL
+parks_4326 <- if (!is.null(osm_parks)) osm_parks$osm_polygons else NULL
+```
+
+# 10. Interactive Map with Free Street and Feature Layers
+
+```{r}
+#| label: interactive-map
+best_venues_sf <- jazz_with_zcta %>%
+  semi_join(best_jazz_by_area, by = c("zcta", "business_id"))
+
+nola_zctas <- la_zctas_clean %>%
+  st_filter(nola_boundary %>% st_transform(st_crs(la_zctas_clean)), .predicate = st_intersects)
+
+nola_zctas_4326 <- st_transform(nola_zctas, 4326)
+best_venues_4326 <- st_transform(best_venues_sf, 4326)
+orleans_water_4326 <- st_transform(orleans_water, 4326)
+
+score_pal <- colorNumeric(
+  palette = "plasma",
+  domain = best_venues_4326$score
+)
+
+map <- leaflet() %>%
+  addProviderTiles(
+    providers$OpenStreetMap.Mapnik,
+    group = "OpenStreetMap Streets"
+  ) %>%
+  addProviderTiles(
+    providers$Esri.WorldStreetMap,
+    group = "Esri Street Map"
+  ) %>%
+  addPolygons(
+    data = orleans_water_4326,
+    fillColor = "#5d8aa8",
+    fillOpacity = 0.45,
+    stroke = FALSE,
+    group = "Water Bodies (River & Canals)"
+  ) %>%
+  addPolygons(
+    data = nola_zctas_4326,
+    color = "#555555",
+    weight = 1.2,
+    dashArray = "3",
+    fillOpacity = 0.08,
+    highlightOptions = highlightOptions(
+      weight = 2,
+      color = "#111111",
+      fillOpacity = 0.18,
+      bringToFront = FALSE
+    ),
+    label = ~paste("ZCTA:", zcta),
+    group = "ZIP Boundaries"
+  )
+
+if (!is.null(parks_4326) && nrow(parks_4326) > 0) {
+  map <- map %>% addPolygons(
+    data = parks_4326,
+    fillColor = "#78c679",
+    fillOpacity = 0.35,
+    color = "#238443",
+    weight = 1,
+    label = ~name,
+    group = "OpenStreetMap Parks"
+  )
+}
+
+if (!is.null(roads_4326) && nrow(roads_4326) > 0) {
+  map <- map %>% addPolylines(
+    data = roads_4326,
+    color = "#777777",
+    weight = 1.2,
+    opacity = 0.7,
+    label = ~name,
+    group = "OpenStreetMap Streets"
+  )
+}
+
+map %>%
+  addCircleMarkers(
+    data = best_venues_4326,
+    radius = ~rescale(review_count, to = c(7, 18)),
+    fillColor = ~score_pal(score),
+    color = "#111111",
+    weight = 1.2,
+    fillOpacity = 0.9,
+    label = ~paste0(name, " (★ ", stars, " | Score: ", round(score, 2), ")"),
+    popup = ~paste0(
+      "<div style='font-family:sans-serif;'>",
+      "<h4 style='margin:0 0 4px 0;'>", name, "</h4>",
+      "<b>ZIP Area:</b> ", zcta, "<br>",
+      "<b>Rating:</b> ", stars, " ★<br>",
+      "<b>Review Count:</b> ", review_count, "<br>",
+      "<b>Jazz Mentions:</b> ", jazz_mentions, "<br>",
+      "<b>Composite Score:</b> ", round(score, 2), "<br>",
+      "<small><b>Categories:</b> ", all_categories, "</small>",
+      "</div>"
+    ),
+    group = "Top Jazz Spots"
+  ) %>%
+  addLegend(
+    pal = score_pal,
+    values = best_venues_4326$score,
+    title = "Composite Score",
+    position = "bottomright"
+  ) %>%
+  addLayersControl(
+    baseGroups = c("OpenStreetMap Streets", "Esri Street Map"),
+    overlayGroups = c(
+      "Water Bodies (River & Canals)",
+      "ZIP Boundaries",
+      "OpenStreetMap Parks",
+      "OpenStreetMap Streets",
+      "Top Jazz Spots"
+    ),
+    options = layersControlOptions(collapsed = FALSE)
+  )
+```
